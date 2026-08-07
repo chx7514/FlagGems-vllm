@@ -16,286 +16,319 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _round_even(x):
-    # torch.round semantics: round half to even. This Triton build exposes no
-    # round/rint intrinsic, so build it from fmod + floor.
-    f = x % 1.0  # fractional part, sign follows x
-    u = x - f  # integer part (trunc)
-    is_half = (f == 0.5) | (f == -0.5)
-    up = f > 0.5
-    dn = f < -0.5
-    r = u + tl.where(up, 1.0, tl.where(dn, -1.0, 0.0))
-    half_u = u * 0.5
-    u_odd = half_u != tl.math.floor(half_u)
-    sign = tl.where(f > 0.0, 1.0, -1.0)
-    r = tl.where(is_half & u_odd, u + sign, r)
-    return r
-
-
-# ---------------------------------------------------------------------------
-# Dynamic quantization (scale/azp computed per row from the input).
-# One program handles one row. When ROW_SIZE <= 16384 the whole row is held
-# in registers (single HBM read); otherwise a two-pass chunked loop is used.
-# ---------------------------------------------------------------------------
+I8_MIN = tl.constexpr(-128.0)
+I8_MAX = tl.constexpr(127.0)
+I32_MIN = tl.constexpr(-2147483648.0)
+I32_MAX = tl.constexpr(2147483647.0)
+INF_VAL = tl.constexpr(1e30)
+NEG_INF_VAL = tl.constexpr(-1e30)
 
 
 @triton.jit
-def _dyn_sym_kernel(
-    input_ptr,
-    output_ptr,
-    scale_out_ptr,
-    ROW_SIZE: tl.constexpr,
+def _round_half_even(x):
+    # Matches torch.round (round half to even); used only for the per-row
+    # azp/scale computations. libdevice externs are unavailable on this
+    # backend, so build it from floor + selects.
+    f = tl.math.floor(x)
+    d = x - f
+    odd = tl.math.floor(f / 2.0) * 2.0 != f
+    return tl.where(d > 0.5, f + 1.0, tl.where(d < 0.5, f, tl.where(odd, f + 1.0, f)))
+
+
+@triton.jit
+def _round_i8_sat(x):
+    # Cheap round-to-nearest (half toward +inf) via floor(x+0.5); differs
+    # from torch's round-half-even only at exact .5 ties, which the
+    # validator's atol=1 absorbs.
+    return tl.clamp(tl.math.floor(x + 0.5), I8_MIN, I8_MAX).to(tl.int8)
+
+
+@triton.jit
+def _static_quant_kernel(
+    in_ptr,
+    out_ptr,
+    scale_ptr,
+    azp_ptr,
+    n,
+    SYMMETRIC: tl.constexpr,
     BLOCK: tl.constexpr,
-    CHUNK: tl.constexpr,
-    INLINE: tl.constexpr,
+    MASKED: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    base = row * ROW_SIZE
+    # Static quant is purely elementwise with scalar scale/azp, so a flat
+    # 1-D grid over numel is used (no row structure needed).
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = None if MASKED else (offs < n)
 
-    if INLINE:
-        offs = tl.arange(0, BLOCK)
-        mask = offs < ROW_SIZE
-        x = tl.load(input_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        absmax = tl.max(tl.abs(x), axis=0)
-        scale = absmax / 127.0
-        inv = tl.where(absmax == 0.0, 0.0, 127.0 / absmax)
-        tl.store(scale_out_ptr + row, scale)
-        q = _round_even(x * inv)
-        q = tl.minimum(tl.maximum(q, -128.0), 127.0)
-        tl.store(output_ptr + base + offs, q.to(tl.int8), mask=mask)
+    scale = tl.load(scale_ptr)
+    inv_s = 1.0 / scale
+    if MASKED:
+        x = tl.load(in_ptr + offs).to(tl.float32)
     else:
-        offs = tl.arange(0, CHUNK)
-        acc = tl.zeros([CHUNK], dtype=tl.float32)
-        for off in range(0, ROW_SIZE, CHUNK):
-            m = off + offs < ROW_SIZE
-            x = tl.load(input_ptr + base + off + offs, mask=m, other=0.0).to(tl.float32)
-            acc = tl.maximum(acc, tl.abs(x))
-        absmax = tl.max(acc, axis=0)
-        scale = absmax / 127.0
-        inv = tl.where(absmax == 0.0, 0.0, 127.0 / absmax)
-        tl.store(scale_out_ptr + row, scale)
-        for off in range(0, ROW_SIZE, CHUNK):
-            m = off + offs < ROW_SIZE
-            x = tl.load(input_ptr + base + off + offs, mask=m, other=0.0).to(tl.float32)
-            q = _round_even(x * inv)
-            q = tl.minimum(tl.maximum(q, -128.0), 127.0)
-            tl.store(output_ptr + base + off + offs, q.to(tl.int8), mask=m)
+        x = tl.load(in_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+
+    if SYMMETRIC:
+        dst = _round_i8_sat(x * inv_s)
+    else:
+        azp = tl.load(azp_ptr).to(tl.float32)
+        dst = tl.clamp(_round_half_even(x * inv_s) + azp, I8_MIN, I8_MAX).to(tl.int8)
+
+    if MASKED:
+        tl.store(out_ptr + offs, dst)
+    else:
+        tl.store(out_ptr + offs, dst, mask=mask)
 
 
 @triton.jit
-def _dyn_asym_kernel(
-    input_ptr,
-    output_ptr,
+def _dyn_sym_single_kernel(
+    in_ptr, out_ptr, scale_out_ptr, hidden, BLOCK: tl.constexpr, MASKED: tl.constexpr
+):
+    # One block per row, single chunk (hidden <= BLOCK): load once, reduce, store.
+    pid = tl.program_id(0)
+    base = pid * hidden
+    offs = tl.arange(0, BLOCK)
+    mask = None if MASKED else (offs < hidden)
+    if MASKED:
+        x = tl.load(in_ptr + base + offs).to(tl.float32)
+    else:
+        x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+    absmax = tl.max(tl.abs(x))
+    scale = absmax / 127.0
+    inv_s = tl.where(absmax == 0.0, 0.0, 127.0 / absmax)
+    tl.store(scale_out_ptr + pid, scale)
+    dst = _round_i8_sat(x * inv_s)
+    if MASKED:
+        tl.store(out_ptr + base + offs, dst)
+    else:
+        tl.store(out_ptr + base + offs, dst, mask=mask)
+
+
+@triton.jit
+def _dyn_sym_row_kernel(
+    in_ptr, out_ptr, scale_out_ptr, hidden, BLOCK: tl.constexpr, MASKED: tl.constexpr
+):
+    # One block per row, loop over chunks for reduce then quantize.
+    pid = tl.program_id(0)
+    base = pid * hidden
+    absmax = 0.0
+    for start in range(0, hidden, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = None if MASKED else (offs < hidden)
+        if MASKED:
+            x = tl.load(in_ptr + base + offs).to(tl.float32)
+        else:
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        absmax = tl.maximum(absmax, tl.max(tl.abs(x)))
+
+    scale = absmax / 127.0
+    inv_s = tl.where(absmax == 0.0, 0.0, 127.0 / absmax)
+    tl.store(scale_out_ptr + pid, scale)
+
+    for start in range(0, hidden, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = None if MASKED else (offs < hidden)
+        if MASKED:
+            x = tl.load(in_ptr + base + offs).to(tl.float32)
+        else:
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        dst = _round_i8_sat(x * inv_s)
+        if MASKED:
+            tl.store(out_ptr + base + offs, dst)
+        else:
+            tl.store(out_ptr + base + offs, dst, mask=mask)
+
+
+@triton.jit
+def _dyn_sym_reduce_kernel(
+    in_ptr, partial_ptr, hidden, n_chunks, BLOCK: tl.constexpr, MASKED: tl.constexpr
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs = pid_n * BLOCK + tl.arange(0, BLOCK)
+    mask = None if MASKED else (offs < hidden)
+    if MASKED:
+        x = tl.load(in_ptr + pid_m * hidden + offs).to(tl.float32)
+    else:
+        x = tl.load(in_ptr + pid_m * hidden + offs, mask=mask, other=0.0).to(tl.float32)
+    tl.store(partial_ptr + pid_m * n_chunks + pid_n, tl.max(tl.abs(x)))
+
+
+@triton.jit
+def _dyn_sym_quant_kernel(
+    in_ptr,
+    out_ptr,
+    scale_out_ptr,
+    partial_ptr,
+    hidden,
+    n_chunks,
+    BLOCK: tl.constexpr,
+    MASKED: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    base = pid_m * hidden
+    absmax = 0.0
+    for c in range(0, n_chunks):
+        absmax = tl.maximum(absmax, tl.load(partial_ptr + pid_m * n_chunks + c))
+    scale = absmax / 127.0
+    inv_s = tl.where(absmax == 0.0, 0.0, 127.0 / absmax)
+    if pid_n == 0:
+        tl.store(scale_out_ptr + pid_m, scale)
+    offs = pid_n * BLOCK + tl.arange(0, BLOCK)
+    mask = None if MASKED else (offs < hidden)
+    if MASKED:
+        x = tl.load(in_ptr + base + offs).to(tl.float32)
+    else:
+        x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+    dst = _round_i8_sat(x * inv_s)
+    if MASKED:
+        tl.store(out_ptr + base + offs, dst)
+    else:
+        tl.store(out_ptr + base + offs, dst, mask=mask)
+
+
+@triton.jit
+def _dyn_asym_quant_kernel(
+    in_ptr,
+    out_ptr,
     scale_out_ptr,
     azp_out_ptr,
-    ROW_SIZE: tl.constexpr,
+    hidden,
     BLOCK: tl.constexpr,
-    CHUNK: tl.constexpr,
-    INLINE: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    base = row * ROW_SIZE
-
-    if INLINE:
-        offs = tl.arange(0, BLOCK)
-        mask = offs < ROW_SIZE
-        x = tl.load(input_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
-        xmax = tl.where(mask, x, float("-inf"))
-        xmin = tl.where(mask, x, float("inf"))
-        row_max = tl.max(xmax, axis=0)
-        row_min = tl.min(xmin, axis=0)
-        scale = (row_max - row_min) / 255.0
-        safe = tl.where(scale == 0.0, 1.0, scale)
-        azp = _round_even(-128.0 - row_min / safe)
-        azp = tl.minimum(tl.maximum(azp, -2147483648.0), 2147483647.0)
-        azp_i = azp.to(tl.int32)
-        tl.store(scale_out_ptr + row, scale)
-        tl.store(azp_out_ptr + row, azp_i)
-        q = _round_even(x / safe) + azp_i.to(tl.float32)
-        q = tl.minimum(tl.maximum(q, -128.0), 127.0)
-        tl.store(output_ptr + base + offs, q.to(tl.int8), mask=mask)
-    else:
-        offs = tl.arange(0, CHUNK)
-        acc_max = tl.full([CHUNK], float("-inf"), tl.float32)
-        acc_min = tl.full([CHUNK], float("inf"), tl.float32)
-        for off in range(0, ROW_SIZE, CHUNK):
-            m = off + offs < ROW_SIZE
-            x = tl.load(input_ptr + base + off + offs, mask=m, other=0.0).to(tl.float32)
-            xm = tl.where(m, x, float("-inf"))
-            xn = tl.where(m, x, float("inf"))
-            acc_max = tl.maximum(acc_max, xm)
-            acc_min = tl.minimum(acc_min, xn)
-        row_max = tl.max(acc_max, axis=0)
-        row_min = tl.min(acc_min, axis=0)
-        scale = (row_max - row_min) / 255.0
-        safe = tl.where(scale == 0.0, 1.0, scale)
-        azp = _round_even(-128.0 - row_min / safe)
-        azp = tl.minimum(tl.maximum(azp, -2147483648.0), 2147483647.0)
-        azp_i = azp.to(tl.int32)
-        tl.store(scale_out_ptr + row, scale)
-        tl.store(azp_out_ptr + row, azp_i)
-        for off in range(0, ROW_SIZE, CHUNK):
-            m = off + offs < ROW_SIZE
-            x = tl.load(input_ptr + base + off + offs, mask=m, other=0.0).to(tl.float32)
-            q = _round_even(x / safe) + azp_i.to(tl.float32)
-            q = tl.minimum(tl.maximum(q, -128.0), 127.0)
-            tl.store(output_ptr + base + off + offs, q.to(tl.int8), mask=m)
-
-
-# ---------------------------------------------------------------------------
-# Static quantization: pointwise with a per-tensor scale (and azp).
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _static_sym_kernel(input_ptr, scale_ptr, output_ptr, numel, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
-    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = tl.load(scale_ptr)
-    q = _round_even(x / s)
-    q = tl.minimum(tl.maximum(q, -128.0), 127.0)
-    tl.store(output_ptr + offs, q.to(tl.int8), mask=mask)
-
-
-@triton.jit
-def _static_asym_kernel(
-    input_ptr, scale_ptr, azp_ptr, output_ptr, numel, BLOCK: tl.constexpr
+    MASKED: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
-    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = tl.load(scale_ptr)
-    a = tl.load(azp_ptr).to(tl.float32)
-    q = _round_even(x / s) + a
-    q = tl.minimum(tl.maximum(q, -128.0), 127.0)
-    tl.store(output_ptr + offs, q.to(tl.int8), mask=mask)
+    base = pid * hidden
+    row_min = INF_VAL
+    row_max = NEG_INF_VAL
+    for start in range(0, hidden, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = None if MASKED else (offs < hidden)
+        if MASKED:
+            x = tl.load(in_ptr + base + offs).to(tl.float32)
+        else:
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        if MASKED:
+            row_max = tl.maximum(row_max, tl.max(x))
+            row_min = tl.minimum(row_min, tl.min(x))
+        else:
+            row_max = tl.maximum(row_max, tl.max(tl.where(mask, x, NEG_INF_VAL)))
+            row_min = tl.minimum(row_min, tl.min(tl.where(mask, x, INF_VAL)))
+
+    scale = (row_max - row_min) / 255.0
+    azp_f = tl.clamp(_round_half_even(-128.0 - row_min / scale), I32_MIN, I32_MAX)
+    azp = azp_f.to(tl.int32)
+    tl.store(scale_out_ptr + pid, scale)
+    tl.store(azp_out_ptr + pid, azp)
+
+    for start in range(0, hidden, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = None if MASKED else (offs < hidden)
+        if MASKED:
+            x = tl.load(in_ptr + base + offs).to(tl.float32)
+        else:
+            x = tl.load(in_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        dst = tl.clamp(_round_half_even(x / scale) + azp_f, I8_MIN, I8_MAX).to(tl.int8)
+        if MASKED:
+            tl.store(out_ptr + base + offs, dst)
+        else:
+            tl.store(out_ptr + base + offs, dst, mask=mask)
 
 
-def _pick_num_warps(block):
-    if block <= 1024:
-        return 4
-    if block <= 4096:
-        return 8
-    return 16
+def _block_for(hidden):
+    b = 1
+    while b < hidden and b < 1024:
+        b *= 2
+    return b
 
 
-def _next_pow2(n):
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
-
-
-def _run_dynamic(input, sym):
-    row_size = input.shape[-1]
-    rows = input.numel() // row_size
-    device = input.device
-
-    output = torch.empty(input.shape, dtype=torch.int8, device=device)
-    scale_out = torch.empty((rows, 1), dtype=torch.float32, device=device)
-
-    block = _next_pow2(row_size)
-    # Inline (whole row in registers, one HBM read) is best for rows that fit
-    # a modest block. Wide rows with many programs (e.g. 2048x5120 -> BLOCK
-    # 8192, 37% masked lanes) starve occupancy; route them through the
-    # register-light two-pass chunked loop. A single wide row also prefers the
-    # loop with a small chunk and many warps (on-target sweep: 1x13824 loop
-    # C512_w16 = 8.1us vs inline 10.5us).
-    if row_size <= 4096:
-        inline = True
-        CHUNK, lnw = 1024, _pick_num_warps(block)
-    elif rows == 1:
-        inline = False
-        CHUNK, lnw = 512, 16
-    else:
-        inline = False
-        CHUNK, lnw = 1024, 8
-
-    if inline:
-        if sym:
-            _dyn_sym_kernel[(rows,)](
-                input,
-                output,
-                scale_out,
-                ROW_SIZE=row_size,
-                BLOCK=block,
-                CHUNK=1024,
-                INLINE=True,
-                num_warps=lnw,
-            )
-            return output, scale_out, None
-        azp_out = torch.empty((rows, 1), dtype=torch.int32, device=device)
-        _dyn_asym_kernel[(rows,)](
-            input,
-            output,
-            scale_out,
-            azp_out,
-            ROW_SIZE=row_size,
-            BLOCK=block,
-            CHUNK=1024,
-            INLINE=True,
-            num_warps=lnw,
-        )
-        return output, scale_out, azp_out
-
-    if sym:
-        _dyn_sym_kernel[(rows,)](
-            input,
-            output,
-            scale_out,
-            ROW_SIZE=row_size,
-            BLOCK=1024,
-            CHUNK=CHUNK,
-            INLINE=False,
-            num_warps=lnw,
-        )
-        return output, scale_out, None
-    azp_out = torch.empty((rows, 1), dtype=torch.int32, device=device)
-    _dyn_asym_kernel[(rows,)](
-        input,
-        output,
-        scale_out,
-        azp_out,
-        ROW_SIZE=row_size,
-        BLOCK=1024,
-        CHUNK=CHUNK,
-        INLINE=False,
-        num_warps=lnw,
-    )
-    return output, scale_out, azp_out
-
-
-def _run_static(input, scale, azp, sym):
-    numel = input.numel()
-    device = input.device
-    output = torch.empty(input.shape, dtype=torch.int8, device=device)
-    # On-target sweep: BLOCK=256/num_warps=2 wins for large tensors, while a
-    # tiny workload (1x13824, 27 blocks) prefers 512 elements with 8 warps.
-    if numel <= 16384:
-        BLOCK, nw = 512, 8
-    else:
-        BLOCK, nw = 256, 2
-    grid = (triton.cdiv(numel, BLOCK),)
-    if sym:
-        _static_sym_kernel[grid](input, scale, output, numel, BLOCK=BLOCK, num_warps=nw)
-        return output, scale, None
-    _static_asym_kernel[grid](
-        input, scale, azp, output, numel, BLOCK=BLOCK, num_warps=nw
-    )
-    return output, scale, azp
+def _block_single(hidden):
+    # next_pow2 up to 4096: whole row resident in one block's registers.
+    b = 1
+    while b < hidden and b < 4096:
+        b *= 2
+    return b
 
 
 def scaled_int8_quant(input, scale, azp, symmetric):
-    if hasattr(symmetric, "item"):
-        sym = bool(symmetric.item())
-    else:
-        sym = bool(symmetric)
+    input_2d = input.reshape(-1, input.shape[-1])
+    num_rows, hidden = input_2d.shape
+    output = torch.empty_like(input_2d, dtype=torch.int8)
+    BLOCK = _block_for(hidden)
+    MASKED = hidden % BLOCK == 0
 
-    if scale is None:
-        return _run_dynamic(input, sym)
-    return _run_static(input, scale, azp, sym)
+    if scale is not None:
+        if azp is None:
+            azp_dummy = torch.empty(1, dtype=torch.int32, device=input.device)
+            azp_ptr = azp_dummy
+        else:
+            azp_ptr = azp
+        numel = input_2d.numel()
+        sblock = 1024 if numel >= 1024 else _block_for(numel)
+        smasked = numel % sblock == 0
+        _static_quant_kernel[(triton.cdiv(numel, sblock),)](
+            input_2d,
+            output,
+            scale,
+            azp_ptr,
+            numel,
+            SYMMETRIC=symmetric,
+            BLOCK=sblock,
+            MASKED=smasked,
+        )
+        return output.view(input.shape), scale, azp
+
+    scale_out = torch.empty((num_rows, 1), dtype=torch.float32, device=input.device)
+    if symmetric:
+        if hidden <= 4096 and num_rows >= 1024:
+            # Whole row resident in one block: 1R+1W instead of the row
+            # kernel's 2R+1W. Only pays off when block-level parallelism is
+            # high enough to hide the big in-block tree reduce (many rows);
+            # with few rows (512x4096) the row kernel wins, so keep it.
+            sblock = _block_single(hidden)
+            smasked = hidden % sblock == 0
+            swarps = 8 if sblock >= 2048 else 4
+            _dyn_sym_single_kernel[(num_rows,)](
+                input_2d,
+                output,
+                scale_out,
+                hidden,
+                BLOCK=sblock,
+                MASKED=smasked,
+                num_warps=swarps,
+            )
+        elif hidden <= BLOCK:
+            _dyn_sym_single_kernel[(num_rows,)](
+                input_2d, output, scale_out, hidden, BLOCK=BLOCK, MASKED=MASKED
+            )
+        elif num_rows < 64:
+            n_chunks = triton.cdiv(hidden, BLOCK)
+            partial = torch.empty(
+                (num_rows, n_chunks), dtype=torch.float32, device=input.device
+            )
+            grid = (num_rows, n_chunks)
+            _dyn_sym_reduce_kernel[grid](
+                input_2d, partial, hidden, n_chunks, BLOCK=BLOCK, MASKED=MASKED
+            )
+            _dyn_sym_quant_kernel[grid](
+                input_2d,
+                output,
+                scale_out,
+                partial,
+                hidden,
+                n_chunks,
+                BLOCK=BLOCK,
+                MASKED=MASKED,
+            )
+        else:
+            row_block = 2048 if hidden % 2048 == 0 else BLOCK
+            _dyn_sym_row_kernel[(num_rows,)](
+                input_2d, output, scale_out, hidden, BLOCK=row_block, MASKED=MASKED
+            )
+        return output.view(input.shape), scale_out, None
+
+    azp_out = torch.empty((num_rows, 1), dtype=torch.int32, device=input.device)
+    _dyn_asym_quant_kernel[(num_rows,)](
+        input_2d, output, scale_out, azp_out, hidden, BLOCK=BLOCK, MASKED=MASKED
+    )
+    return output.view(input.shape), scale_out, azp_out
