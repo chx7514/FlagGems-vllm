@@ -28,17 +28,17 @@ import triton.language as tl
 
 from flaggems_vllm import runtime
 from flaggems_vllm.ops.scaled_int8_quant import (
+    _MAIN_TAIL_MAX_HIDDEN,
+    _SINGLE_PASS_MAX_HIDDEN,
+    _SINGLE_PASS_MAX_HIDDEN_WIDE,
+    _decompose_main_tail,
     _dynamic_int8_quant_kernel,
     _dynamic_int8_quant_kernel_azp_single_pass,
     _dynamic_int8_quant_kernel_main_tail,
     _dynamic_int8_quant_kernel_single_pass,
-    _MAIN_TAIL_MAX_HIDDEN,
-    _round_i32_sat,
     _round_i8_sat,
+    _round_i32_sat,
     _saturate_i32_to_i8,
-    _SINGLE_PASS_MAX_HIDDEN,
-    _SINGLE_PASS_MAX_HIDDEN_WIDE,
-    _decompose_main_tail,
     _token_bucket,
 )
 from flaggems_vllm.utils import libentry
@@ -101,9 +101,7 @@ def scaled_int8_quant(
         azp_or_dummy = azp if azp is not None else scale  # unused in this path
 
         numel = input_2d.numel()
-        grid = lambda META: (  # noqa: E731
-            triton.cdiv(numel, META["BLOCK_SIZE"]),
-        )
+        grid = lambda META: (triton.cdiv(numel, META["BLOCK_SIZE"]),)  # noqa: E731
         _static_int8_quant_kernel_flat[grid](
             input_2d,
             output,
